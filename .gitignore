@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+state/
+*.sqlite3*
+.env
+.env.*
+*.env
+!deploy/example.env
+*.log
+*.bin
+*.zip
+*.db
+*.jsonl

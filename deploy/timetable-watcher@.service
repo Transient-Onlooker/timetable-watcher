@@ -1,0 +1,11 @@
+[Unit]
+Description=Timetable Watcher morning notice (%i)
+
+[Service]
+Type=oneshot
+UMask=0077
+NoNewPrivileges=true
+TimeoutStartSec=90s
+WorkingDirectory=%h/timetable-watcher
+EnvironmentFile=%h/.config/timetable-watcher/%i.env
+ExecStart=/usr/bin/python3 %h/timetable-watcher/timetable_watcher.py morning

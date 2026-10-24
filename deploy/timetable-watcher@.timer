@@ -1,0 +1,13 @@
+[Unit]
+Description=Weekday timetable notice at 09:00 Asia/Seoul (%i)
+
+[Timer]
+OnCalendar=Mon..Fri *-*-* 09:00:00 Asia/Seoul
+OnCalendar=Mon..Fri *-*-* 09:05:00 Asia/Seoul
+OnCalendar=Mon..Fri *-*-* 09:10:00 Asia/Seoul
+AccuracySec=1s
+Persistent=false
+Unit=timetable-watcher@%i.service
+
+[Install]
+WantedBy=timers.target

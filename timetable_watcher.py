@@ -693,6 +693,11 @@ def main(argv: list[str] | None = None) -> int:
                 return 0
         else:
             baseline = json.loads(prior["lessons_json"]) if prior else None
+            flagged = [x for x in lessons if x.get("site_changed")]
+            recent = _recent_change_lines(baseline, lessons) if baseline is not None else []
+            if not flagged and not recent:
+                print("변동 없어 아침 발송 생략")
+                return 0
 
         message = format_message(target, args.grade, args.classroom, lessons,
                                  baseline, decoded.last_update, args.action,

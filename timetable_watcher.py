@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import hashlib
 import http.cookiejar
 import json
@@ -20,7 +21,13 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-BASE = "https://timetable.s2h9.dev"
+BASE = "https://timetable.s2h9.dev"  # Student-facing viewer link shown in messages.
+# Live data comes from the original Comci server (comci.net), not the viewer:
+# the viewer's CDN challenges non-browser clients with a bot check (HTTP 403).
+COMCI_BASE = "http://comci.net:4082"
+COMCI_MAIN_ROUTE = "36179"       # Extracted from the Comci /st page; rotates occasionally.
+COMCI_TIMETABLE_ROUTE = "73629"  # Keep in sync with the routes the /st page serves.
+MAX_COMCI_BYTES = 16 * 1024 * 1024
 DEFAULT_SCHOOL_CODE = "0"  # Unconfigured: select your own school via environment or CLI
 KST = timezone(timedelta(hours=9))
 DAY_NAMES = "월화수목금토일"
@@ -227,6 +234,144 @@ def validate_school_code(value: str) -> str:
     return value
 
 
+def _comci_code_parts(code: Any) -> tuple[int, int, bool]:
+    """Split a Comci lesson code into (teacher idx, subject idx, changed).
+
+    Codes pack teacher/subject dictionary indexes as trailing digit groups;
+    a leading '>' marks a lesson changed from the original timetable.
+    """
+    s = str(code)
+    changed = s.startswith(">")
+    if changed:
+        s = s[1:]
+    parts = re.findall(r"\d{1,3}(?=(?:\d{3})+(?!\d))|\d{1,3}$", s)
+    if len(parts) < 2:
+        raise TimetableError(f"Unrecognized Comci lesson code: {code!r}")
+    ma = [int(x) for x in reversed(parts)]
+    teacher = ma[0]
+    subject = ma[1] + (ma[2] if len(ma) > 2 else 0) * 1000
+    return teacher, subject, changed
+
+
+def _comci_original(orig_codes: Any, period: int,
+                    subjects: list, teachers: list) -> tuple[str | None, str | None]:
+    """Pre-change (subject, teacher) for a period; best-effort decoration."""
+    if not isinstance(orig_codes, list) or period >= len(orig_codes):
+        return None, None
+    code = orig_codes[period]
+    if not code or str(code).lstrip(">") == "0":
+        return None, None
+    try:
+        teacher_idx, subject_idx, _ = _comci_code_parts(code)
+    except TimetableError:
+        return None, None
+    subject = subjects[subject_idx] if 0 <= subject_idx < len(subjects) else ""
+    teacher = teachers[teacher_idx] if 0 <= teacher_idx < len(teachers) else ""
+    return subject, teacher
+
+
+def _comci_day_lessons(day_codes: Any, orig_codes: Any,
+                       subjects: list, teachers: list) -> list[dict[str, Any]]:
+    if not isinstance(day_codes, list) or not day_codes:
+        return []
+    total = day_codes[0]
+    if not isinstance(total, int) or not 0 < total <= 12:
+        return []
+    lessons = []
+    for period in range(1, total + 1):
+        code = day_codes[period] if period < len(day_codes) else 0
+        if not code:
+            continue
+        if str(code).lstrip(">") == "0":
+            # '>0' marks a lesson removed from the original timetable.
+            if not str(code).startswith(">"):
+                continue
+            original_subject, original_teacher = _comci_original(
+                orig_codes, period, subjects, teachers)
+            lessons.append({
+                "period": period, "subject": "", "teacher": "",
+                "site_changed": True,
+                "original_subject": original_subject,
+                "original_teacher": original_teacher,
+            })
+            continue
+        teacher_idx, subject_idx, changed = _comci_code_parts(code)
+        original_subject = None
+        original_teacher = None
+        if changed:
+            original_subject, original_teacher = _comci_original(
+                orig_codes, period, subjects, teachers)
+        lessons.append({
+            "period": period,
+            "subject": subjects[subject_idx] if 0 <= subject_idx < len(subjects) else "",
+            "teacher": teachers[teacher_idx] if 0 <= teacher_idx < len(teachers) else "",
+            "site_changed": changed,
+            "original_subject": original_subject,
+            "original_teacher": original_teacher,
+        })
+    return lessons
+
+
+def decode_comci(payload: dict) -> Decoded:
+    """Build a Decoded from the original Comci JSON payload.
+
+    Field map (observed 2026-10-30): 시작일 week-start date, 자료244
+    last-update timestamp, 자료147 current timetable codes, 자료481
+    pre-change timetable codes, 자료446 teacher names, 자료492 subject
+    names. 자료147/481 are [grade][class][weekday 1=Mon] arrays whose
+    first element is the day's period count.
+    """
+    try:
+        week_start = datetime.strptime(str(payload["시작일"]), "%Y-%m-%d").date()
+        subjects = payload["자료492"]
+        teachers = payload["자료446"]
+        table = payload["자료147"]
+        originals = payload.get("자료481") or []
+        last_update = str(payload.get("자료244", ""))
+    except (KeyError, TypeError, ValueError) as exc:
+        raise TimetableError("Unrecognized Comci response; API format may have changed") from exc
+    if not isinstance(table, list) or not isinstance(subjects, list) or not isinstance(teachers, list):
+        raise TimetableError("Unrecognized Comci response; API format may have changed")
+    classes: dict[tuple[int, int], dict[str, list[dict[str, Any]]]] = {}
+    for grade, grade_rows in enumerate(table):
+        if grade == 0 or not isinstance(grade_rows, list):
+            continue
+        orig_grade = originals[grade] if grade < len(originals) else []
+        for classroom, class_rows in enumerate(grade_rows):
+            if classroom == 0 or not isinstance(class_rows, list):
+                continue
+            orig_rows = orig_grade[classroom] if isinstance(orig_grade, list) and classroom < len(orig_grade) else []
+            week_days = {}
+            for weekday in range(5):
+                day = week_start + timedelta(days=weekday)
+                day_codes = class_rows[weekday + 1] if weekday + 1 < len(class_rows) else []
+                orig_codes = orig_rows[weekday + 1] if isinstance(orig_rows, list) and weekday + 1 < len(orig_rows) else []
+                week_days[day.isoformat()] = _comci_day_lessons(day_codes, orig_codes, subjects, teachers)
+            classes[(grade, classroom)] = week_days
+    if not classes:
+        raise TimetableError("Comci response contained no classes")
+    return Decoded(week_start, week_start + timedelta(days=4), last_update, classes)
+
+
+def _comci_fetch_json(school_code: str, period: int) -> dict:
+    raw = f"{COMCI_TIMETABLE_ROUTE}_{school_code}_0_{period}"
+    query = base64.b64encode(raw.encode()).decode()
+    url = f"{COMCI_BASE}/{COMCI_MAIN_ROUTE}?{query}"
+    last_err: Exception | None = None
+    for _ in range(5):  # Comci sometimes truncates large responses mid-stream.
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+            with urllib.request.urlopen(req, timeout=25) as response:
+                if response.getcode() != 200:
+                    raise TimetableError(f"Comci returned HTTP {response.getcode()}")
+                body = read_bounded(response, MAX_COMCI_BYTES, "Comci")
+            return json.loads(body.replace(b"\x00", b"").decode("utf-8"))
+        except (urllib.error.URLError, OSError, ValueError) as exc:
+            last_err = exc
+            time.sleep(2)
+    raise TimetableError(f"Comci request failed after retries: {last_err}") from None
+
+
 def fetch_timetable(target: date, fixture_dir: Path | None = None,
                     school_code: str = DEFAULT_SCHOOL_CODE) -> tuple[Decoded, int]:
     school_code = validate_school_code(school_code)
@@ -238,53 +383,11 @@ def fetch_timetable(target: date, fixture_dir: Path | None = None,
                 return decoded, period
         raise TimetableError(f"Date {target} not in fixture's 2 weeks")
 
-    jar = http.cookiejar.CookieJar()
-    opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
-    page = f"{BASE}/?sc={school_code}"
-    headers = {"User-Agent": USER_AGENT}
-    with opener.open(urllib.request.Request(page, headers=headers), timeout=20) as response:
-        if response.getcode() != 200:
-            raise TimetableError(f"Bootstrap returned HTTP {response.getcode()}")
-        html = read_bounded(response, MAX_BOOTSTRAP_BYTES, "Bootstrap").decode("utf-8")
-    match = re.search(
-        r'<script\b(?=[^>]*\bid\s*=\s*["\']__next_data__["\'])[^>]*>(.*?)</script>',
-        html, re.I | re.S
-    )
-    if not match:
-        raise TimetableError("CSRF bootstrap script not found; page layout changed")
-    try:
-        token = json.loads(match.group(1))["csrfToken"]
-    except (ValueError, KeyError, TypeError) as exc:
-        raise TimetableError("Invalid CSRF bootstrap JSON/token") from exc
-    if not isinstance(token, str) or not token:
-        raise TimetableError("Missing CSRF token")
-
     for period in (1, 2):
-        query = urllib.parse.urlencode({"schoolCode": school_code, "period": period})
-        req = urllib.request.Request(f"{BASE}/api/getalltimetable?{query}", headers={
-            "User-Agent": USER_AGENT,
-            "Accept": "application/x-protobuf",
-            "X-CSRF-Token": token,
-            "Referer": page,
-            "Cache-Control": "no-cache",
-        })
-        with opener.open(req, timeout=20) as response:
-            if response.getcode() != 200:
-                raise TimetableError(f"API period={period} returned HTTP {response.getcode()}")
-            ct = response.headers.get("Content-Type", "").lower()
-            if "protobuf" not in ct:
-                raise TimetableError(f"Unexpected API Content-Type: {ct}")
-            message_type = response.headers.get("x-protobuf-message")
-            if message_type and message_type != "comsigan.timetable.v1.TimetableResponse":
-                raise TimetableError(f"Unexpected Protobuf message type: {message_type}")
-            body = read_bounded(response, MAX_TIMETABLE_BYTES, "Protobuf")
-            api_last = response.headers.get("x-timetable-last-update")
-        decoded = decode_timetable(body, period)
-        if api_last and decoded.last_update != api_last:
-            raise TimetableError("Response last-update timestamp disagrees with payload")
+        decoded = decode_comci(_comci_fetch_json(school_code, period))
         if decoded.week_start <= target <= decoded.week_end:
             return decoded, period
-    raise TimetableError(f"Date {target} was not in API's current/next week")
+    raise TimetableError(f"Date {target} was not in Comci's current/next week")
 
 
 def target_lessons(decoded: Decoded, day: date, grade: int, classroom: int) -> list[dict[str, Any]]:
@@ -614,7 +717,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("action", choices=("inspect", "capture", "morning", "watch"))
     parser.add_argument("--school-code", default=os.getenv("TIMETABLE_SCHOOL_CODE", DEFAULT_SCHOOL_CODE),
-                        help="School code from timetable.s2h9.dev/?sc=... (required for real requests)")
+                        help="Comci school code (required for real requests)")
     parser.add_argument("--school-name", default=os.getenv("TIMETABLE_SCHOOL_NAME"),
                         help="Display label for Google Chat messages (optional)")
     parser.add_argument("--grade", type=int, default=int(os.getenv("TIMETABLE_GRADE", "2")))

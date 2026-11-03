@@ -331,9 +331,9 @@ def decode_comci(payload: dict) -> Decoded:
         table = payload["자료156"]
         originals = payload.get("자료180") or []
         last_update = str(payload.get("자료177", ""))
-        bunri = payload.get("분리", 100)
+        bunri = payload.get("분리", 1000)
         if not isinstance(bunri, int) or bunri <= 0:
-            bunri = 100
+            bunri = 1000
     except (KeyError, TypeError, ValueError) as exc:
         raise TimetableError("Unrecognized Comci response; API format may have changed") from exc
     if not isinstance(table, list) or not isinstance(subjects, list) or not isinstance(teachers, list):

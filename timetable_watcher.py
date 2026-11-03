@@ -25,8 +25,8 @@ BASE = "https://timetable.s2h9.dev"  # Student-facing viewer link shown in messa
 # Live data comes from the original Comci server (comci.net), not the viewer:
 # the viewer's CDN challenges non-browser clients with a bot check (HTTP 403).
 COMCI_BASE = "http://comci.net:4082"
-COMCI_MAIN_ROUTE = "36179"       # Extracted from the Comci /st page; rotates occasionally.
-COMCI_TIMETABLE_ROUTE = "73629"  # Keep in sync with the routes the /st page serves.
+COMCI_ROUTE = "161150"  # Single route since the 2026-11 Comci source change; re-extract from the /st page if it breaks.
+COMCI_TT_PREFIX = "86866"  # Timetable query prefix from the decoded /st JS (sc_data).
 MAX_COMCI_BYTES = 16 * 1024 * 1024
 DEFAULT_SCHOOL_CODE = "0"  # Unconfigured: select your own school via environment or CLI
 KST = timezone(timedelta(hours=9))
@@ -254,7 +254,7 @@ def _comci_code_parts(code: Any) -> tuple[int, int, bool]:
 
 
 def _comci_original(orig_codes: Any, period: int,
-                    subjects: list, teachers: list) -> tuple[str | None, str | None]:
+                    subjects: list, teachers: list, bunri: int) -> tuple[str | None, str | None]:
     """Pre-change (subject, teacher) for a period; best-effort decoration."""
     if not isinstance(orig_codes, list) or period >= len(orig_codes):
         return None, None
@@ -265,13 +265,14 @@ def _comci_original(orig_codes: Any, period: int,
         teacher_idx, subject_idx, _ = _comci_code_parts(code)
     except TimetableError:
         return None, None
+    subject_idx %= bunri
     subject = subjects[subject_idx] if 0 <= subject_idx < len(subjects) else ""
     teacher = teachers[teacher_idx] if 0 <= teacher_idx < len(teachers) else ""
     return subject, teacher
 
 
 def _comci_day_lessons(day_codes: Any, orig_codes: Any,
-                       subjects: list, teachers: list) -> list[dict[str, Any]]:
+                       subjects: list, teachers: list, bunri: int) -> list[dict[str, Any]]:
     if not isinstance(day_codes, list) or not day_codes:
         return []
     total = day_codes[0]
@@ -287,7 +288,7 @@ def _comci_day_lessons(day_codes: Any, orig_codes: Any,
             if not str(code).startswith(">"):
                 continue
             original_subject, original_teacher = _comci_original(
-                orig_codes, period, subjects, teachers)
+                orig_codes, period, subjects, teachers, bunri)
             lessons.append({
                 "period": period, "subject": "", "teacher": "",
                 "site_changed": True,
@@ -296,11 +297,12 @@ def _comci_day_lessons(day_codes: Any, orig_codes: Any,
             })
             continue
         teacher_idx, subject_idx, changed = _comci_code_parts(code)
+        subject_idx %= bunri
         original_subject = None
         original_teacher = None
         if changed:
             original_subject, original_teacher = _comci_original(
-                orig_codes, period, subjects, teachers)
+                orig_codes, period, subjects, teachers, bunri)
         lessons.append({
             "period": period,
             "subject": subjects[subject_idx] if 0 <= subject_idx < len(subjects) else "",
@@ -315,19 +317,23 @@ def _comci_day_lessons(day_codes: Any, orig_codes: Any,
 def decode_comci(payload: dict) -> Decoded:
     """Build a Decoded from the original Comci JSON payload.
 
-    Field map (observed 2026-10-30): 시작일 week-start date, 자료244
-    last-update timestamp, 자료147 current timetable codes, 자료481
-    pre-change timetable codes, 자료446 teacher names, 자료492 subject
-    names. 자료147/481 are [grade][class][weekday 1=Mon] arrays whose
-    first element is the day's period count.
+    Field map (observed 2026-11-04, after the Comci source change): 시작일
+    week-start date, 자료177 last-update timestamp, 자료156 current
+    timetable codes, 자료180 pre-change timetable codes, 자료122 teacher
+    names, 자료194 subject names, 분리 subject-index modulus. 자료156/180
+    are [grade][class][weekday 1=Mon] arrays whose first element is the
+    day's period count.
     """
     try:
         week_start = datetime.strptime(str(payload["시작일"]), "%Y-%m-%d").date()
-        subjects = payload["자료492"]
-        teachers = payload["자료446"]
-        table = payload["자료147"]
-        originals = payload.get("자료481") or []
-        last_update = str(payload.get("자료244", ""))
+        subjects = payload["자료194"]
+        teachers = payload["자료122"]
+        table = payload["자료156"]
+        originals = payload.get("자료180") or []
+        last_update = str(payload.get("자료177", ""))
+        bunri = payload.get("분리", 100)
+        if not isinstance(bunri, int) or bunri <= 0:
+            bunri = 100
     except (KeyError, TypeError, ValueError) as exc:
         raise TimetableError("Unrecognized Comci response; API format may have changed") from exc
     if not isinstance(table, list) or not isinstance(subjects, list) or not isinstance(teachers, list):
@@ -346,7 +352,7 @@ def decode_comci(payload: dict) -> Decoded:
                 day = week_start + timedelta(days=weekday)
                 day_codes = class_rows[weekday + 1] if weekday + 1 < len(class_rows) else []
                 orig_codes = orig_rows[weekday + 1] if isinstance(orig_rows, list) and weekday + 1 < len(orig_rows) else []
-                week_days[day.isoformat()] = _comci_day_lessons(day_codes, orig_codes, subjects, teachers)
+                week_days[day.isoformat()] = _comci_day_lessons(day_codes, orig_codes, subjects, teachers, bunri)
             classes[(grade, classroom)] = week_days
     if not classes:
         raise TimetableError("Comci response contained no classes")
@@ -354,18 +360,20 @@ def decode_comci(payload: dict) -> Decoded:
 
 
 def _comci_fetch_json(school_code: str, period: int) -> dict:
-    raw = f"{COMCI_TIMETABLE_ROUTE}_{school_code}_0_{period}"
+    raw = f"{COMCI_TT_PREFIX}_{school_code}_0_{period}"
     query = base64.b64encode(raw.encode()).decode()
-    url = f"{COMCI_BASE}/{COMCI_MAIN_ROUTE}?{query}"
+    url = f"{COMCI_BASE}/{COMCI_ROUTE}?{query}"
     last_err: Exception | None = None
     for _ in range(5):  # Comci sometimes truncates large responses mid-stream.
         try:
-            req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+            req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT,
+                                                        "Referer": f"{COMCI_BASE}/st"})
             with urllib.request.urlopen(req, timeout=25) as response:
                 if response.getcode() != 200:
                     raise TimetableError(f"Comci returned HTTP {response.getcode()}")
                 body = read_bounded(response, MAX_COMCI_BYTES, "Comci")
-            return json.loads(body.replace(b"\x00", b"").decode("utf-8"))
+            text = body.replace(b"\x00", b"").decode("utf-8", "replace")
+            return json.loads(text[: text.rindex("}") + 1])
         except (urllib.error.URLError, OSError, ValueError) as exc:
             last_err = exc
             time.sleep(2)

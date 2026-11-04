@@ -25,8 +25,14 @@ BASE = "https://timetable.s2h9.dev"  # Student-facing viewer link shown in messa
 # Live data comes from the original Comci server (comci.net), not the viewer:
 # the viewer's CDN challenges non-browser clients with a bot check (HTTP 403).
 COMCI_BASE = "http://comci.net:4082"
-COMCI_ROUTE = "161150"  # Single route since the 2026-11 Comci source change; re-extract from the /st page if it breaks.
-COMCI_TT_PREFIX = "86866"  # Timetable query prefix from the decoded /st JS (sc_data).
+# Fallback values (extracted 2026-11-04). Comci rotates the route, the query
+# prefix and the 자료 key numbers within a single day, so comci_codes()
+# re-extracts them from the /st page on every run; these constants are only
+# used when that extraction fails.
+COMCI_ROUTE = "161150"
+COMCI_TT_PREFIX = "86866"
+COMCI_FALLBACK_KEYS = {"daily": "156", "original": "180", "teacher": "122",
+                       "subject": "194", "update": "177"}
 MAX_COMCI_BYTES = 16 * 1024 * 1024
 DEFAULT_SCHOOL_CODE = "0"  # Unconfigured: select your own school via environment or CLI
 KST = timezone(timedelta(hours=9))
@@ -314,23 +320,125 @@ def _comci_day_lessons(day_codes: Any, orig_codes: Any,
     return lessons
 
 
-def decode_comci(payload: dict) -> Decoded:
+def _decode_obfuscated_block(block: str) -> str:
+    """Decode one hour-obfuscated-v2 wrapper without executing any of it.
+
+    The wrapper is (function(a,k){...})([[flag, payload], ...], K); only the
+    literal arguments are read. JS strings are UTF-16 code-unit sequences, so
+    fragments are reassembled as utf-16-le (a surrogate pair may be split
+    across fragments).
+    """
+    b = block.strip()
+    m = re.search(r"\}\)\(\[(.*)\]\s*,\s*(\d+)\)\s*;?\s*$", b, re.S)
+    if not m:
+        raise TimetableError("Unrecognized /st obfuscation wrapper")
+    arr = json.loads("[" + m.group(1) + "]")
+    k = int(m.group(2))
+    out = []
+    for flag, payload in arr:
+        if flag:
+            out.append(payload.encode("utf-16-le", "surrogatepass"))
+            continue
+        units = bytearray()
+        for j in range(0, len(payload), 4):
+            unit = int(payload[j:j + 4], 16) ^ ((k + (j // 4) * 13) & 255)
+            units.extend(unit.to_bytes(2, "little"))
+        out.append(bytes(units))
+    raw = b"".join(out)
+    return raw.decode("utf-16-le", "surrogatepass").encode(
+        "utf-16-le", "surrogatepass").decode("utf-16-le", "surrogatepass")
+
+
+def _decode_st_page(html: str) -> str:
+    """Replace hour-obfuscated-v2 script blocks with their decoded source."""
+    def repl(m: re.Match) -> str:
+        body = m.group(2)
+        if "hour-obfuscated" not in body:
+            return m.group(0)
+        return m.group(1) + _decode_obfuscated_block(body) + m.group(3)
+    return re.sub(r"(<script\b[^>]*>)(.*?)(</script\s*>)", repl, html,
+                  flags=re.I | re.S)
+
+
+# Extraction patterns over the decoded /st source (same approach as
+# pycomcigan 1.4.2). Only the numeric parts are captured, so small wrapper
+# changes do not break them; Q성명/Q과목명 wrappers (added 2026-05) are
+# optional. "update" is best-effort: the fallback key is used if it is absent.
+_COMCI_PATTERNS = {
+    "route": r"\.(/\d+)\?\d+l",
+    "tt_prefix": r"sc_data\(\s*'(\d+)_",
+    "teacher": r"성명\s*=\s*(?:Q성명\(\s*)?자료\.자료(\d+)",
+    "subject": r"(?:과목명\s*=\s*(?:Q과목명\(\s*)?)?자료\.자료(\d+)\[sb\]",
+    "daily": r"일일자료\s*=\s*Q자료\(\s*자료\.자료(\d+)",
+    "original": r"원자료\s*=\s*Q자료\(\s*자료\.자료(\d+)",
+    "update": r"=\s*H시간표\.자료(\d+)",
+}
+_COMCI_REQUIRED = ("route", "tt_prefix", "teacher", "subject", "daily", "original")
+
+_comci_codes_cache: dict | None = None
+
+
+def comci_codes() -> dict:
+    """Route/prefix/자료 key numbers for the Comci API, extracted live.
+
+    Comci rotates these numbers within a day, so they are re-read from the
+    /st page on first use in each process. On any failure the 2026-11-04
+    fallback constants are returned, which is no worse than hardcoding.
+    """
+    global _comci_codes_cache
+    if _comci_codes_cache is not None:
+        return _comci_codes_cache
+    fallback = {"route": COMCI_ROUTE, "tt_prefix": COMCI_TT_PREFIX,
+                **COMCI_FALLBACK_KEYS}
+    last_err: Exception | None = None
+    for _ in range(3):
+        try:
+            req = urllib.request.Request(f"{COMCI_BASE}/st",
+                                         headers={"User-Agent": USER_AGENT})
+            with urllib.request.urlopen(req, timeout=25) as response:
+                body = read_bounded(response, MAX_BOOTSTRAP_BYTES, "Comci /st")
+            content = _decode_st_page(body.decode("cp949", "replace"))
+            codes = dict(fallback)
+            for name, pat in _COMCI_PATTERNS.items():
+                m = re.search(pat, content)
+                if m is not None:
+                    codes[name] = m.group(1)
+            missing = [n for n in _COMCI_REQUIRED if codes[n] == fallback[n]
+                       and re.search(_COMCI_PATTERNS[n], content) is None]
+            if missing:
+                raise TimetableError(f"Comci code extraction failed: {missing}")
+            codes["route"] = codes["route"].lstrip("/")
+            _comci_codes_cache = codes
+            return codes
+        except Exception as exc:  # noqa: BLE001 - fall back on any failure
+            last_err = exc
+            time.sleep(2)
+    print(f"WARNING: Comci code extraction failed ({last_err}); "
+          "using fallback constants", file=sys.stderr)
+    _comci_codes_cache = fallback
+    return fallback
+
+
+def decode_comci(payload: dict, keys: dict | None = None) -> Decoded:
     """Build a Decoded from the original Comci JSON payload.
 
-    Field map (observed 2026-11-04, after the Comci source change): 시작일
-    week-start date, 자료177 last-update timestamp, 자료156 current
-    timetable codes, 자료180 pre-change timetable codes, 자료122 teacher
-    names, 자료194 subject names, 분리 subject-index modulus. 자료156/180
-    are [grade][class][weekday 1=Mon] arrays whose first element is the
-    day's period count.
+    Field map: 시작일 week-start date, 자료<update> last-update timestamp,
+    자료<daily> current timetable codes, 자료<original> pre-change timetable
+    codes, 자료<teacher> teacher names, 자료<subject> subject names, 분리
+    subject-index modulus. The 자료 numbers rotate, so live callers pass the
+    keys from comci_codes(); the default is the 2026-11-04 fallback set.
+    Daily/original are [grade][class][weekday 1=Mon] arrays whose first
+    element is the day's period count.
     """
+    if keys is None:
+        keys = COMCI_FALLBACK_KEYS
     try:
         week_start = datetime.strptime(str(payload["시작일"]), "%Y-%m-%d").date()
-        subjects = payload["자료194"]
-        teachers = payload["자료122"]
-        table = payload["자료156"]
-        originals = payload.get("자료180") or []
-        last_update = str(payload.get("자료177", ""))
+        subjects = payload["자료" + keys["subject"]]
+        teachers = payload["자료" + keys["teacher"]]
+        table = payload["자료" + keys["daily"]]
+        originals = payload.get("자료" + keys["original"]) or []
+        last_update = str(payload.get("자료" + keys["update"], ""))
         bunri = payload.get("분리", 1000)
         if not isinstance(bunri, int) or bunri <= 0:
             bunri = 1000
@@ -359,10 +467,10 @@ def decode_comci(payload: dict) -> Decoded:
     return Decoded(week_start, week_start + timedelta(days=4), last_update, classes)
 
 
-def _comci_fetch_json(school_code: str, period: int) -> dict:
-    raw = f"{COMCI_TT_PREFIX}_{school_code}_0_{period}"
+def _comci_fetch_json(school_code: str, period: int, codes: dict) -> dict:
+    raw = f"{codes['tt_prefix']}_{school_code}_0_{period}"
     query = base64.b64encode(raw.encode()).decode()
-    url = f"{COMCI_BASE}/{COMCI_ROUTE}?{query}"
+    url = f"{COMCI_BASE}/{codes['route']}?{query}"
     last_err: Exception | None = None
     for _ in range(5):  # Comci sometimes truncates large responses mid-stream.
         try:
@@ -391,8 +499,9 @@ def fetch_timetable(target: date, fixture_dir: Path | None = None,
                 return decoded, period
         raise TimetableError(f"Date {target} not in fixture's 2 weeks")
 
+    codes = comci_codes()
     for period in (1, 2):
-        decoded = decode_comci(_comci_fetch_json(school_code, period))
+        decoded = decode_comci(_comci_fetch_json(school_code, period, codes), codes)
         if decoded.week_start <= target <= decoded.week_end:
             return decoded, period
     raise TimetableError(f"Date {target} was not in Comci's current/next week")

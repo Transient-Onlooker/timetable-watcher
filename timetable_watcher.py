@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
-"""Lightweight multi-school timetable watcher. Python stdlib only."""
+"""Lightweight multi-school timetable watcher.
+
+Live Comci access is delegated to the vendored pycomcigan copy under
+vendor/ (upstream PR #12, dependency-free build); this file owns state,
+diffing and Google Chat notification only.
+"""
 from __future__ import annotations
 
 import argparse
-import ast
-import base64
-import binascii
 import hashlib
-import hmac
-import http.cookiejar
 import json
 import os
 import re
@@ -25,25 +25,16 @@ from pathlib import Path
 from typing import Any
 
 BASE = "https://timetable.s2h9.dev"  # Student-facing viewer link shown in messages.
-# Live data comes from the original Comci server (comci.net), not the viewer:
-# the viewer's CDN challenges non-browser clients with a bot check (HTTP 403).
-COMCI_BASE = "http://comci.net:4082"
-# Fallback values (extracted 2026-11-04). Comci rotates the route, the query
-# prefix and the 자료 key numbers within a single day, so comci_codes()
-# re-extracts them from the /st page on every run; these constants are only
-# used when that extraction fails.
-COMCI_ROUTE = "161150"
-COMCI_TT_PREFIX = "86866"
-COMCI_FALLBACK_KEYS = {"daily": "156", "original": "180", "teacher": "122",
-                       "subject": "194", "update": "177"}
+# Live data comes from the original Comci server (comci.net) via pycomcigan,
+# not the viewer: the viewer's CDN challenges non-browser clients with a
+# bot check (HTTP 403).
+_VENDOR_DIR = Path(__file__).resolve().parent / "vendor"
+if _VENDOR_DIR.is_dir():
+    sys.path.insert(0, str(_VENDOR_DIR))
 MAX_COMCI_BYTES = 16 * 1024 * 1024
 DEFAULT_SCHOOL_CODE = "0"  # Unconfigured: select your own school via environment or CLI
 KST = timezone(timedelta(hours=9))
 DAY_NAMES = "월화수목금토일"
-USER_AGENT = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-              "AppleWebKit/537.36 Chrome/131.0.0.0 Safari/537.36")
-MAX_BOOTSTRAP_BYTES = 2 * 1024 * 1024
-MAX_TIMETABLE_BYTES = 4 * 1024 * 1024
 MAX_CHANGE_DETAILS = 3  # 4+ changed periods: show only the updated timetable
 
 
@@ -243,610 +234,114 @@ def validate_school_code(value: str) -> str:
     return value
 
 
-def _comci_code_parts(code: Any) -> tuple[int, int, bool]:
-    """Split a Comci lesson code into (teacher idx, subject idx, changed).
-
-    Codes pack teacher/subject dictionary indexes as trailing digit groups;
-    a leading '>' marks a lesson changed from the original timetable.
-    """
-    s = str(code)
-    changed = s.startswith(">")
-    if changed:
-        s = s[1:]
-    parts = re.findall(r"\d{1,3}(?=(?:\d{3})+(?!\d))|\d{1,3}$", s)
-    if len(parts) < 2:
-        raise TimetableError(f"Unrecognized Comci lesson code: {code!r}")
-    ma = [int(x) for x in reversed(parts)]
-    teacher = ma[0]
-    subject = ma[1] + (ma[2] if len(ma) > 2 else 0) * 1000
-    return teacher, subject, changed
-
-
-def _comci_original(orig_codes: Any, period: int,
-                    subjects: list, teachers: list, bunri: int) -> tuple[str | None, str | None]:
-    """Pre-change (subject, teacher) for a period; best-effort decoration."""
-    if not isinstance(orig_codes, list) or period >= len(orig_codes):
-        return None, None
-    code = orig_codes[period]
-    if not code or str(code).lstrip(">") == "0":
-        return None, None
-    try:
-        teacher_idx, subject_idx, _ = _comci_code_parts(code)
-    except TimetableError:
-        return None, None
-    subject_idx %= bunri
-    subject = subjects[subject_idx] if 0 <= subject_idx < len(subjects) else ""
-    teacher = teachers[teacher_idx] if 0 <= teacher_idx < len(teachers) else ""
-    return subject, teacher
-
-
-def _comci_day_lessons(day_codes: Any, orig_codes: Any,
-                       subjects: list, teachers: list, bunri: int) -> list[dict[str, Any]]:
-    if not isinstance(day_codes, list) or not day_codes:
-        return []
-    total = day_codes[0]
-    if not isinstance(total, int) or not 0 < total <= 12:
-        return []
-    lessons = []
-    for period in range(1, total + 1):
-        code = day_codes[period] if period < len(day_codes) else 0
-        if not code:
-            continue
-        if str(code).lstrip(">") == "0":
-            # '>0' marks a lesson removed from the original timetable.
-            if not str(code).startswith(">"):
-                continue
-            original_subject, original_teacher = _comci_original(
-                orig_codes, period, subjects, teachers, bunri)
-            lessons.append({
-                "period": period, "subject": "", "teacher": "",
-                "site_changed": True,
-                "original_subject": original_subject,
-                "original_teacher": original_teacher,
-            })
-            continue
-        teacher_idx, subject_idx, changed = _comci_code_parts(code)
-        subject_idx %= bunri
-        original_subject = None
-        original_teacher = None
-        if changed:
-            original_subject, original_teacher = _comci_original(
-                orig_codes, period, subjects, teachers, bunri)
-        lessons.append({
-            "period": period,
-            "subject": subjects[subject_idx] if 0 <= subject_idx < len(subjects) else "",
-            "teacher": teachers[teacher_idx] if 0 <= teacher_idx < len(teachers) else "",
-            "site_changed": changed,
-            "original_subject": original_subject,
-            "original_teacher": original_teacher,
-        })
-    return lessons
-
-
-def _decode_obfuscated_block(block: str) -> str:
-    """Decode one hour-obfuscated-v2 wrapper without executing any of it.
-
-    The wrapper is (function(a,k){...})([[flag, payload], ...], K); only the
-    literal arguments are read. JS strings are UTF-16 code-unit sequences, so
-    fragments are reassembled as utf-16-le (a surrogate pair may be split
-    across fragments).
-    """
-    b = block.strip()
-    m = re.search(r"\}\)\(\[(.*)\]\s*,\s*(\d+)\)\s*;?\s*$", b, re.S)
-    if not m:
-        raise TimetableError("Unrecognized /st obfuscation wrapper")
-    arr = json.loads("[" + m.group(1) + "]")
-    k = int(m.group(2))
-    out = []
-    for flag, payload in arr:
-        if flag:
-            out.append(payload.encode("utf-16-le", "surrogatepass"))
-            continue
-        units = bytearray()
-        for j in range(0, len(payload), 4):
-            unit = int(payload[j:j + 4], 16) ^ ((k + (j // 4) * 13) & 255)
-            units.extend(unit.to_bytes(2, "little"))
-        out.append(bytes(units))
-    raw = b"".join(out)
-    return raw.decode("utf-16-le", "surrogatepass").encode(
-        "utf-16-le", "surrogatepass").decode("utf-16-le", "surrogatepass")
-
-
-def _decode_ajax_obfuscated_block(text: str) -> str:
-    """Decode hour-ajax-obfuscated-v1 blocks nested in the decoded /st page.
-
-    Since the enc5 change (2026-11-07) the timetable request code
-    (QAjaxSchool/QAjaxTimetable) and the response-key function (HChange) are
-    hidden in these blocks, which are themselves emitted by the v2-decoded
-    source. Same XOR scheme as the v2 wrapper, but the payload is 8-bit JS
-    source: flag 1 fragments are literal, flag 0 fragments are hex-encoded
-    with each byte XORed by (k + (j // 4) * 13) & 255. Only literal arguments
-    are read; nothing is executed.
-    """
-    out: list[str] = []
-    pos = 0
-    while True:
-        m = re.search(r"hour-ajax-obfuscated-v1", text[pos:])
-        if m is None:
-            out.append(text[pos:])
-            break
-        start = pos + m.start()
-        out.append(text[pos:start])
-        arr_open = text.find("})([[", start)
-        if arr_open < 0:
-            raise TimetableError("Unrecognized ajax obfuscation wrapper")
-        arr_start = arr_open + len("})([[")
-        end = re.search(r"\]\],(\d+)\);", text[arr_start:])
-        if end is None:
-            raise TimetableError("Unrecognized ajax obfuscation wrapper")
-        arr = json.loads("[[" + text[arr_start:arr_start + end.start()] + "]]")
-        k = int(end.group(1))
-        src: list[str] = []
-        for flag, payload in arr:
-            if flag:
-                src.append(payload)
-                continue
-            chars = []
-            for j in range(0, len(payload), 4):
-                chars.append(chr(int(payload[j:j + 4], 16)
-                                 ^ ((k + (j // 4) * 13) & 255)))
-            src.append("".join(chars))
-        out.append("".join(src))
-        pos = arr_start + end.end()
-    return "".join(out)
-
-
-def _decode_st_page(html: str) -> str:
-    """Replace hour-obfuscated-v2 script blocks with their decoded source.
-
-    The decoded source may itself contain hour-ajax-obfuscated-v1 blocks
-    (request code and response-key function since enc5); those are decoded
-    in a second pass.
-    """
-    def repl(m: re.Match) -> str:
-        body = m.group(2)
-        if "hour-obfuscated" not in body:
-            return m.group(0)
-        return m.group(1) + _decode_obfuscated_block(body) + m.group(3)
-    decoded = re.sub(r"(<script\b[^>]*>)(.*?)(</script\s*>)", repl, html,
-                     flags=re.I | re.S)
-    if "hour-ajax-obfuscated-v1" in decoded:
-        decoded = _decode_ajax_obfuscated_block(decoded)
-    return decoded
-
-
-# --- Pure-Python AES decryption (FIPS 197) ---
-# AES is not in the standard library and this watcher stays stdlib-only, so
-# Comci's encrypted (enc5/enc1) responses are decrypted here. Only
-# decryption is needed: the server encrypts, we verify the HMAC-SHA256 tag
-# and decrypt AES-CBC with PKCS#7 unpadding.
-_AES_SBOX: list[int] | None = None
-_AES_INV_SBOX: list[int] | None = None
-_AES_MUL: dict[int, list[int]] = {}
-
-
-def _aes_build_tables() -> None:
-    global _AES_SBOX, _AES_INV_SBOX
-    if _AES_SBOX is not None:
-        return
-
-    def gf_mul(a: int, b: int) -> int:
-        p = 0
-        for _ in range(8):
-            if b & 1:
-                p ^= a
-            hi = a & 0x80
-            a = (a << 1) & 0xFF
-            if hi:
-                a ^= 0x1B
-            b >>= 1
-        return p
-
-    def gf_inv(a: int) -> int:
-        result, base, exp = 1, a, 254
-        while exp:
-            if exp & 1:
-                result = gf_mul(result, base)
-            base = gf_mul(base, base)
-            exp >>= 1
-        return result
-
-    def rotl8(x: int, n: int) -> int:
-        return ((x << n) | (x >> (8 - n))) & 0xFF
-
-    sbox = []
-    for i in range(256):
-        inv = 0 if i == 0 else gf_inv(i)
-        sbox.append(inv ^ rotl8(inv, 1) ^ rotl8(inv, 2)
-                    ^ rotl8(inv, 3) ^ rotl8(inv, 4) ^ 0x63)
-    inv_sbox = [0] * 256
-    for i, s in enumerate(sbox):
-        inv_sbox[s] = i
-    for factor in (9, 11, 13, 14):
-        _AES_MUL[factor] = [gf_mul(factor, x) for x in range(256)]
-    _AES_SBOX = sbox
-    _AES_INV_SBOX = inv_sbox
-
-
-_AES_RCON = (0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80, 0x1B, 0x36)
-
-
-def _aes_expand_key(key: bytes) -> tuple[list[bytes], int]:
-    _aes_build_tables()
-    assert _AES_SBOX is not None
-    nk = len(key) // 4
-    nr = nk + 6
-    w = [list(key[4 * i:4 * i + 4]) for i in range(nk)]
-    for i in range(nk, 4 * (nr + 1)):
-        temp = list(w[i - 1])
-        if i % nk == 0:
-            temp = temp[1:] + temp[:1]
-            temp = [_AES_SBOX[b] for b in temp]
-            temp[0] ^= _AES_RCON[i // nk - 1]
-        elif nk > 6 and i % nk == 4:
-            temp = [_AES_SBOX[b] for b in temp]
-        w.append([w[i - nk][j] ^ temp[j] for j in range(4)])
-    round_keys = [bytes(w[4 * r] + w[4 * r + 1] + w[4 * r + 2] + w[4 * r + 3])
-                  for r in range(nr + 1)]
-    return round_keys, nr
-
-
-def _aes_decrypt_block(block: bytes, round_keys: list[bytes], nr: int) -> bytes:
-    assert _AES_INV_SBOX is not None
-    s = [b ^ round_keys[nr][i] for i, b in enumerate(block)]
-    mul9, mul11, mul13, mul14 = (_AES_MUL[9], _AES_MUL[11],
-                                 _AES_MUL[13], _AES_MUL[14])
-    for rnd in range(nr - 1, 0, -1):
-        # InvShiftRows: row r shifts right by r (state is column-major).
-        s = [s[4 * ((c - r) % 4) + r] for c in range(4) for r in range(4)]
-        s = [_AES_INV_SBOX[b] for b in s]  # InvSubBytes
-        rk = round_keys[rnd]
-        s = [b ^ rk[i] for i, b in enumerate(s)]  # AddRoundKey
-        t = [0] * 16  # InvMixColumns
-        for c in range(4):
-            a0, a1, a2, a3 = s[4 * c], s[4 * c + 1], s[4 * c + 2], s[4 * c + 3]
-            t[4 * c] = mul14[a0] ^ mul11[a1] ^ mul13[a2] ^ mul9[a3]
-            t[4 * c + 1] = mul9[a0] ^ mul14[a1] ^ mul11[a2] ^ mul13[a3]
-            t[4 * c + 2] = mul13[a0] ^ mul9[a1] ^ mul14[a2] ^ mul11[a3]
-            t[4 * c + 3] = mul11[a0] ^ mul13[a1] ^ mul9[a2] ^ mul14[a3]
-        s = t
-    s = [s[4 * ((c - r) % 4) + r] for c in range(4) for r in range(4)]
-    s = [_AES_INV_SBOX[b] for b in s]
-    rk = round_keys[0]
-    return bytes(b ^ rk[i] for i, b in enumerate(s))
-
-
-def _aes_cbc_decrypt(ciphertext: bytes, key: bytes, iv: bytes) -> bytes:
-    if len(key) not in (16, 24, 32):
-        raise TimetableError("Invalid encryption key length")
-    if len(iv) != 16 or not ciphertext or len(ciphertext) % 16:
-        raise TimetableError("Invalid encrypted response length")
-    round_keys, nr = _aes_expand_key(key)
-    out = bytearray()
-    prev = iv
-    for off in range(0, len(ciphertext), 16):
-        block = ciphertext[off:off + 16]
-        plain = _aes_decrypt_block(block, round_keys, nr)
-        out.extend(a ^ b for a, b in zip(plain, prev))
-        prev = block
-    if not out:
-        raise TimetableError("Invalid encrypted response padding")
-    pad = out[-1]
-    if not 1 <= pad <= 16 or out[-pad:] != bytes([pad]) * pad:
-        raise TimetableError("Invalid encrypted response padding")
-    return bytes(out[:-pad])
-
-
-def _decode_encrypted_response(text: str, key: bytes, version: str) -> dict:
-    """Verify and decrypt an enc5/enc1 timetable envelope; return the JSON dict.
-
-    Envelope: version:iv:ciphertext:hmac — base64 fields for enc5+,
-    hex fields for enc1. The HMAC key is SHA-256(key) over the first three
-    fields joined by ':'.
-    """
-    if not isinstance(version, str) or not re.fullmatch(r"enc[0-9]+", version):
-        raise TimetableError("Unsupported encryption version")
-    fields = text.rstrip("\x00").split(":")
-    if len(fields) != 4 or fields[0] not in (version, "enc1"):
-        raise TimetableError("Encrypted response protocol mismatch")
-    try:
-        if fields[0] != "enc1":
-            parts = [base64.b64decode(field, validate=True) for field in fields[1:]]
-            if any(base64.b64encode(part).decode("ascii") != field
-                   for part, field in zip(parts, fields[1:])):
-                raise ValueError
-        else:
-            if any(not re.fullmatch(r"(?:[0-9a-f]{2})*", field)
-                   for field in fields[1:]):
-                raise ValueError
-            parts = [bytes.fromhex(field) for field in fields[1:]]
-    except (ValueError, binascii.Error):
-        raise TimetableError("Invalid encrypted response encoding") from None
-    iv, ciphertext, tag = parts
-    if len(iv) != 16 or len(tag) != 32 or not ciphertext or len(ciphertext) % 16:
-        raise TimetableError("Invalid encrypted response length")
-    expected = hmac.new(hashlib.sha256(key).digest(),
-                        ":".join(fields[:3]).encode("utf-8"),
-                        hashlib.sha256).digest()
-    if not hmac.compare_digest(expected, tag):
-        raise TimetableError("Encrypted response authentication failed")
-    try:
-        plain = _aes_cbc_decrypt(ciphertext, key, iv).decode("utf-8").rstrip("\x00")
-        value = json.loads(plain)
-    except (UnicodeDecodeError, ValueError):
-        raise TimetableError("Invalid encrypted response content") from None
-    if not isinstance(value, dict):
-        raise TimetableError("Encrypted response JSON root must be an object")
-    return value
-
-
-def _parse_enc_service_protocol(content: str) -> dict | None:
-    """Extract the encrypted timetable protocol from the decoded /st page.
-
-    Returns None when the page has no QAjaxTimetable (legacy protocol).
-    Otherwise returns route, version (e.g. 'enc5'), request token (or None
-    when the page does not advertise the X-Hour-Token header) and the
-    response key bytes. Only literal page fragments are interpreted; the
-    key expression may be a plain hex literal or a reordering of literal
-    hex fragments, as in the page's HChange function.
-    """
-    school = re.search(
-        r"function\s+QAjaxSchool\s*\([^)]*\)\s*\{(?:(?!\bfunction\b).)*?"
-        r"url\s*:\s*'\.(/\d+)\?'\s*\+\s*encodeURIComponent\(btoa\("
-        r"'(\d+l)'\s*\+\s*encodeURIComponent\(sc\)\s*\+\s*'_(enc\d+)'\)\)",
-        content, re.S)
-    timetable = re.search(
-        r"function\s+QAjaxTimetable\s*\([^)]*\)\s*\{(?:(?!\bfunction\b).)*?"
-        r"url\s*:\s*'\.(/\d+)\?'\s*\+\s*btoa\([^;{}]*?'_(enc[0-9]+)'\s*\)",
-        content, re.S)
-    if timetable is None:
-        return None
-    endpoint, version = timetable.groups()
-    if school is not None and (school.group(1), school.group(3)) != (endpoint, version):
-        raise TimetableError(
-            "Comcigan service page structure changed: school and timetable "
-            "request protocols do not match")
-    section_end = re.search(r"\bfunction\s+\w+\s*\(", content[timetable.end():])
-    section = content[timetable.start():
-                      timetable.end() + (section_end.start() if section_end else 0)]
-    token = None
-    if re.search(r"['\"]X-Hour-Token['\"]\s*:\s*window\.__HourRequestToken",
-                 section) is not None:
-        token_match = re.search(
-            r"\bwindow\.__HourRequestToken\s*=\s*(['\"])([0-9a-fA-F]+)\1\s*;",
-            content)
-        if token_match is None:
-            raise TimetableError("Unable to parse Comcigan request token literal")
-        token = token_match.group(2)
-    key_match = re.search(
-        r"var\s+key\s*=\s*CryptoJS\.enc\.Hex\.parse\((.*?)\);", content, re.S)
-    if key_match is None:
-        raise TimetableError("Unable to parse Comcigan response key")
-    expression = key_match.group(1).strip()
-    literal = re.fullmatch(r"'([0-9a-fA-F]+)'", expression)
-    if literal:
-        key_hex = literal.group(1)
-    else:
-        pieces = re.fullmatch(
-            r"\(function\(a\)\{return\s+(a\[\d+\](?:\+a\[\d+\])*)\s*;\}\)\((\[.*\])\)",
-            expression, re.S)
-        if pieces is None:
-            raise TimetableError("Unable to parse Comcigan response key expression")
-        if re.fullmatch(r"\[\s*'[0-9a-fA-F]+'(?:\s*,\s*'[0-9a-fA-F]+')*\s*\]",
-                        pieces.group(2)) is None:
-            raise TimetableError("Invalid Comcigan response key fragments")
-        fragments = ast.literal_eval(pieces.group(2))
-        indexes = [int(i) for i in re.findall(r"a\[(\d+)\]", pieces.group(1))]
-        if any(i >= len(fragments) for i in indexes):
-            raise TimetableError("Invalid Comcigan response key indexes")
-        key_hex = "".join(fragments[i] for i in indexes)
-    if len(key_hex) not in (32, 48, 64):
-        raise TimetableError("Invalid Comcigan response key size")
-    return {"route": endpoint.lstrip("/"), "version": version,
-            "token": token, "key": bytes.fromhex(key_hex)}
-
-
-# Extraction patterns over the decoded /st source (same approach as
-# pycomcigan 1.4.2). Only the numeric parts are captured, so small wrapper
-# changes do not break them; Q성명/Q과목명 wrappers (added 2026-05) are
-# optional. "update" is best-effort: the fallback key is used if it is absent.
-_COMCI_PATTERNS = {
-    "route": r"\.(/\d+)\?\d+l",
-    "tt_prefix": r"sc_data\(\s*'(\d+)_",
-    "teacher": r"성명\s*=\s*(?:Q성명\(\s*)?자료\.자료(\d+)",
-    "subject": r"(?:과목명\s*=\s*(?:Q과목명\(\s*)?)?자료\.자료(\d+)\[sb\]",
-    "daily": r"일일자료\s*=\s*Q자료\(\s*자료\.자료(\d+)",
-    "original": r"원자료\s*=\s*Q자료\(\s*자료\.자료(\d+)",
-    "update": r"=\s*H시간표\.자료(\d+)",
-}
-_COMCI_REQUIRED = ("route", "tt_prefix", "teacher", "subject", "daily", "original")
-
-_comci_codes_cache: dict | None = None
-
 RPI_SSH = os.getenv("TIMETABLE_RPI_SSH",
                     "/home/hatch/workspace/.ssh-tunnel/rpi_ssh.sh")
 
 
-def _comci_http_get(url: str, headers: dict, limit: int,
-                    description: str) -> bytes:
-    """GET a Comci URL and return the body, bounded by limit.
+class _PipeResponse:
+    """urlopen 반환 객체 흉내: with 문맥·read()·status만 제공한다."""
 
-    With TIMETABLE_FETCH_VIA_RPI=1 (VM-side health checks only) the
-    request is piped through the Raspberry Pi over SSH, because the
-    VM's egress proxy truncates large Comci responses. Main (running
-    on the Pi) never sets the variable and fetches directly.
+    def __init__(self, data: bytes, status: int = 200):
+        self._data = data
+        self.status = status
+
+    def read(self, *args: Any) -> bytes:
+        return self._data
+
+    def __enter__(self) -> "_PipeResponse":
+        return self
+
+    def __exit__(self, *exc: Any) -> bool:
+        return False
+
+
+def _rpi_curl_bytes(url: str, headers: dict) -> bytes:
+    """Fetch a URL on the Raspberry Pi via SSH curl (VM health checks)."""
+    import shlex
+    import subprocess
+
+    parts = ["curl -sf --max-time 25"]
+    for k, v in headers.items():
+        parts.append(f"-H {shlex.quote(f'{k}: {v}')}")
+    parts.append(shlex.quote(url))
+    p = subprocess.run([RPI_SSH, " ".join(parts)],
+                       capture_output=True, timeout=70)
+    if p.returncode != 0 or not p.stdout:
+        raise TimetableError(
+            f"Comci via-RPi fetch failed (rc={p.returncode})")
+    if len(p.stdout) > MAX_COMCI_BYTES:
+        raise TimetableError("Comci response too large")
+    return p.stdout
+
+
+def _install_rpi_transport() -> None:
+    """TIMETABLE_FETCH_VIA_RPI=1이면 pycomcigan의 urlopen을 RPi 경유로 교체.
+
+    VM egress 프록시가 컴시간의 큰 응답을 자르기 때문에, VM에서 도는
+    건강 검사는 수신만 RPi에 맡긴다. Main(Pi)에서는 이 변수를 설정하지
+    않으며 pycomcigan이 직접 받는다.
     """
-    if os.getenv("TIMETABLE_FETCH_VIA_RPI") == "1":
-        import shlex
-        import subprocess
+    if os.getenv("TIMETABLE_FETCH_VIA_RPI") != "1":
+        return
+    import pycomcigan.helpers as helpers
 
-        parts = ["curl -sf --max-time 25"]
-        for k, v in headers.items():
-            parts.append(f"-H {shlex.quote(f'{k}: {v}')}")
-        parts.append(shlex.quote(url))
-        p = subprocess.run([RPI_SSH, " ".join(parts)],
-                           capture_output=True, timeout=70)
-        if p.returncode != 0 or not p.stdout:
-            raise TimetableError(
-                f"Comci via-RPi fetch failed (rc={p.returncode}): "
-                f"{description}")
-        if len(p.stdout) > limit:
-            raise TimetableError(f"{description} response too large")
-        return p.stdout
-    req = urllib.request.Request(url, headers=headers)
-    with urllib.request.urlopen(req, timeout=25) as response:
-        if response.getcode() != 200:
-            raise TimetableError(
-                f"Comci returned HTTP {response.getcode()}")
-        return read_bounded(response, limit, description)
+    if getattr(helpers, "_watcher_pipe", False):
+        return
+
+    def patched_urlopen(req: Any, timeout: float | None = None, **kwargs: Any):
+        url = getattr(req, "full_url", req)
+        headers = dict(req.header_items()) if hasattr(req, "header_items") else {}
+        return _PipeResponse(_rpi_curl_bytes(url, headers))
+
+    helpers.urlopen = patched_urlopen  # type: ignore[assignment]
+    helpers._watcher_pipe = True  # type: ignore[attr-defined]
 
 
-def comci_codes() -> dict:
-    """Route/prefix/자료 key numbers for the Comci API, extracted live.
-
-    Comci rotates these numbers within a day, so they are re-read from the
-    /st page on first use in each process. On the legacy (pre-enc5) page a
-    failure falls back to the 2026-11-04 constants, which is no worse than
-    hardcoding. On an encrypted (enc5) page there is no usable fallback —
-    the route, request token and response key all rotate with the page — so
-    an extraction failure raises instead of returning stale constants.
-    The returned dict also carries "version" (e.g. "enc5", absent for the
-    legacy protocol), "token" and "key" when the page uses encryption.
-    """
-    global _comci_codes_cache
-    if _comci_codes_cache is not None:
-        return _comci_codes_cache
-    fallback = {"route": COMCI_ROUTE, "tt_prefix": COMCI_TT_PREFIX,
-                **COMCI_FALLBACK_KEYS}
-    last_err: Exception | None = None
-    enc_detected = False
-    for _ in range(3):
-        try:
-            body = _comci_http_get(f"{COMCI_BASE}/st",
-                                   {"User-Agent": USER_AGENT},
-                                   MAX_BOOTSTRAP_BYTES, "Comci /st")
-            content = _decode_st_page(body.decode("cp949", "replace"))
-            if "QAjaxTimetable" in content or "HChange" in content:
-                enc_detected = True
-            protocol = _parse_enc_service_protocol(content)
-            codes = dict(fallback)
-            for name, pat in _COMCI_PATTERNS.items():
-                if protocol is not None and name == "route":
-                    continue
-                m = re.search(pat, content)
-                if m is not None:
-                    codes[name] = m.group(1)
-            if protocol is not None:
-                codes.update(protocol)
-                required = ("route", "tt_prefix", "teacher", "subject",
-                            "daily", "original", "version", "key")
-            else:
-                required = _COMCI_REQUIRED
-            missing = []
-            for n in required:
-                if protocol is not None and n in protocol:
-                    # Route/version/key/token come from the protocol parser,
-                    # not from the legacy patterns.
-                    if codes.get(n) in (None, ""):
-                        missing.append(n)
-                elif n in _COMCI_PATTERNS:
-                    if re.search(_COMCI_PATTERNS[n], content) is None:
-                        missing.append(n)
-                elif codes.get(n) in (None, ""):
-                    missing.append(n)
-            if missing:
-                raise TimetableError(f"Comci code extraction failed: {missing}")
-            codes["route"] = codes["route"].lstrip("/")
-            _comci_codes_cache = codes
-            return codes
-        except Exception as exc:  # noqa: BLE001 - fall back on any failure
-            last_err = exc
-            time.sleep(2)
-    if enc_detected:
-        raise TimetableError(f"Comci code extraction failed ({last_err})")
-    print(f"WARNING: Comci code extraction failed ({last_err}); "
-          "using fallback constants", file=sys.stderr)
-    _comci_codes_cache = fallback
-    return fallback
+def _lessons_from_pycomcigan(entries: list) -> list[dict[str, Any]]:
+    """pycomcigan 하루치 TimeTableData를 watcher의 lesson dict로 변환."""
+    lessons: list[dict[str, Any]] = []
+    for entry in entries:
+        subject = entry.subject or ""
+        teacher = entry.teacher or ""
+        if not subject and not teacher and not entry.replaced:
+            continue  # pycomcigan이 8교시까지 채우는 빈 교시
+        original = entry.original
+        lessons.append({
+            "period": entry.period,
+            "subject": subject,
+            "teacher": teacher,
+            "site_changed": bool(entry.replaced),
+            "original_subject": original.subject if original else None,
+            "original_teacher": original.teacher if original else None,
+        })
+    return lessons
 
 
-def decode_comci(payload: dict, keys: dict | None = None) -> Decoded:
-    """Build a Decoded from the original Comci JSON payload.
-
-    Field map: 시작일 week-start date, 자료<update> last-update timestamp,
-    자료<daily> current timetable codes, 자료<original> pre-change timetable
-    codes, 자료<teacher> teacher names, 자료<subject> subject names, 분리
-    subject-index modulus. The 자료 numbers rotate, so live callers pass the
-    keys from comci_codes(); the default is the 2026-11-04 fallback set.
-    Daily/original are [grade][class][weekday 1=Mon] arrays whose first
-    element is the day's period count.
-    """
-    if keys is None:
-        keys = COMCI_FALLBACK_KEYS
-    try:
-        week_start = datetime.strptime(str(payload["시작일"]), "%Y-%m-%d").date()
-        subjects = payload["자료" + keys["subject"]]
-        teachers = payload["자료" + keys["teacher"]]
-        table = payload["자료" + keys["daily"]]
-        originals = payload.get("자료" + keys["original"]) or []
-        last_update = str(payload.get("자료" + keys["update"], ""))
-        bunri = payload.get("분리", 1000)
-        if not isinstance(bunri, int) or bunri <= 0:
-            bunri = 1000
-    except (KeyError, TypeError, ValueError) as exc:
-        raise TimetableError("Unrecognized Comci response; API format may have changed") from exc
-    if not isinstance(table, list) or not isinstance(subjects, list) or not isinstance(teachers, list):
-        raise TimetableError("Unrecognized Comci response; API format may have changed")
+def _decoded_from_pycomcigan(tt: Any) -> Decoded:
+    week_start = datetime.strptime(str(tt.start_date), "%Y-%m-%d").date()
     classes: dict[tuple[int, int], dict[str, list[dict[str, Any]]]] = {}
-    for grade, grade_rows in enumerate(table):
-        if grade == 0 or not isinstance(grade_rows, list):
+    for grade in range(1, len(tt.timetable)):
+        grade_rows = tt.timetable[grade]
+        if not isinstance(grade_rows, list):
             continue
-        orig_grade = originals[grade] if grade < len(originals) else []
-        for classroom, class_rows in enumerate(grade_rows):
-            if classroom == 0 or not isinstance(class_rows, list):
-                continue
-            orig_rows = orig_grade[classroom] if isinstance(orig_grade, list) and classroom < len(orig_grade) else []
-            week_days = {}
+        for classroom in range(1, len(grade_rows)):
+            class_rows = grade_rows[classroom]
+            week_days: dict[str, list[dict[str, Any]]] = {}
             for weekday in range(5):
                 day = week_start + timedelta(days=weekday)
-                day_codes = class_rows[weekday + 1] if weekday + 1 < len(class_rows) else []
-                orig_codes = orig_rows[weekday + 1] if isinstance(orig_rows, list) and weekday + 1 < len(orig_rows) else []
-                week_days[day.isoformat()] = _comci_day_lessons(day_codes, orig_codes, subjects, teachers, bunri)
+                entries = (class_rows[weekday + 1]
+                           if weekday + 1 < len(class_rows) else [])
+                week_days[day.isoformat()] = _lessons_from_pycomcigan(entries)
             classes[(grade, classroom)] = week_days
     if not classes:
         raise TimetableError("Comci response contained no classes")
-    return Decoded(week_start, week_start + timedelta(days=4), last_update, classes)
-
-
-def _comci_fetch_json(school_code: str, period: int, codes: dict) -> dict:
-    version = codes.get("version")
-    if version:
-        if not codes.get("key"):
-            raise TimetableError("Comci code extraction failed: ['key']")
-        raw = f"{codes['tt_prefix']}_{school_code}_0_{period}_{version}"
-    else:
-        raw = f"{codes['tt_prefix']}_{school_code}_0_{period}"
-    query = base64.b64encode(raw.encode()).decode()
-    url = f"{COMCI_BASE}/{codes['route']}?{query}"
-    headers = {"User-Agent": USER_AGENT, "Referer": f"{COMCI_BASE}/st"}
-    if codes.get("token"):
-        headers["X-Hour-Token"] = codes["token"]
-    last_err: Exception | None = None
-    for _ in range(5):  # Comci sometimes truncates large responses mid-stream.
-        try:
-            body = _comci_http_get(url, headers, MAX_COMCI_BYTES, "Comci")
-            text = body.replace(b"\x00", b"").decode("utf-8", "replace")
-            if version:
-                return _decode_encrypted_response(text, codes["key"], version)
-            return json.loads(text[: text.rindex("}") + 1])
-        except (urllib.error.URLError, OSError, ValueError) as exc:
-            last_err = exc
-            time.sleep(2)
-    raise TimetableError(f"Comci request failed after retries: {last_err}") from None
+    return Decoded(week_start, week_start + timedelta(days=4),
+                   str(tt.update_date), classes)
 
 
 def fetch_timetable(target: date, fixture_dir: Path | None = None,
-                    school_code: str = DEFAULT_SCHOOL_CODE) -> tuple[Decoded, int]:
+                    school_code: str = DEFAULT_SCHOOL_CODE,
+                    school_name: str | None = None) -> tuple[Decoded, int]:
     school_code = validate_school_code(school_code)
     if fixture_dir is not None:
         for period in (1, 2):
@@ -856,11 +351,31 @@ def fetch_timetable(target: date, fixture_dir: Path | None = None,
                 return decoded, period
         raise TimetableError(f"Date {target} not in fixture's 2 weeks")
 
-    codes = comci_codes()
-    for period in (1, 2):
-        decoded = decode_comci(_comci_fetch_json(school_code, period, codes), codes)
+    # 실조회는 동봉한 pycomcigan 사본에 맡긴다. 프로토콜 대응은 라이브러리
+    # 교체만으로 끝나고, 이 파일은 상태·비교·알림만 담당한다.
+    name = school_name or os.getenv("TIMETABLE_SCHOOL_NAME")
+    if not name:
+        raise TimetableError("Set TIMETABLE_SCHOOL_NAME or --school-name "
+                             "(pycomcigan school search needs the school name)")
+    _install_rpi_transport()
+    import pycomcigan
+
+    last_err: Exception | None = None
+    for week_num in (0, 1):
+        for _ in range(3):
+            try:
+                tt = pycomcigan.TimeTable(name, school_code=int(school_code),
+                                          week_num=week_num)
+                break
+            except Exception as exc:  # noqa: BLE001 - re-raised as TimetableError
+                last_err = exc
+                time.sleep(2)
+        else:
+            raise TimetableError(
+                f"Comci request failed after retries: {last_err}")
+        decoded = _decoded_from_pycomcigan(tt)
         if decoded.week_start <= target <= decoded.week_end:
-            return decoded, period
+            return decoded, week_num + 1
     raise TimetableError(f"Date {target} was not in Comci's current/next week")
 
 
@@ -1220,7 +735,8 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.action == "inspect":
         # Inspecting the API response must not create or modify a database.
-        decoded, period = fetch_timetable(target, args.fixture_dir, school_code=args.school_code)
+        decoded, period = fetch_timetable(target, args.fixture_dir, school_code=args.school_code,
+                                          school_name=args.school_name)
         lessons = target_lessons(decoded, target, args.grade, args.classroom)
         print(f"{target} / school={args.school_code} / period={period} / {args.grade}-{args.classroom} / "
               f"{len(lessons)}교시 / last_update={decoded.last_update}")
@@ -1239,7 +755,8 @@ def main(argv: list[str] | None = None) -> int:
                 print("아침 메시지 발송 내역이 없어 추가 변경 알림을 생략함")
                 return 0
 
-        decoded, period = fetch_timetable(target, args.fixture_dir, school_code=args.school_code)
+        decoded, period = fetch_timetable(target, args.fixture_dir, school_code=args.school_code,
+                                          school_name=args.school_name)
         lessons = target_lessons(decoded, target, args.grade, args.classroom)
         print(f"{target} / school={args.school_code} / period={period} / {args.grade}-{args.classroom} / "
               f"{len(lessons)}교시 / last_update={decoded.last_update}")

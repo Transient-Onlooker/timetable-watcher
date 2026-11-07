@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import base64
+import binascii
 import hashlib
+import hmac
 import http.cookiejar
 import json
 import os
@@ -349,15 +352,298 @@ def _decode_obfuscated_block(block: str) -> str:
         "utf-16-le", "surrogatepass").decode("utf-16-le", "surrogatepass")
 
 
+def _decode_ajax_obfuscated_block(text: str) -> str:
+    """Decode hour-ajax-obfuscated-v1 blocks nested in the decoded /st page.
+
+    Since the enc5 change (2026-11-07) the timetable request code
+    (QAjaxSchool/QAjaxTimetable) and the response-key function (HChange) are
+    hidden in these blocks, which are themselves emitted by the v2-decoded
+    source. Same XOR scheme as the v2 wrapper, but the payload is 8-bit JS
+    source: flag 1 fragments are literal, flag 0 fragments are hex-encoded
+    with each byte XORed by (k + (j // 4) * 13) & 255. Only literal arguments
+    are read; nothing is executed.
+    """
+    out: list[str] = []
+    pos = 0
+    while True:
+        m = re.search(r"hour-ajax-obfuscated-v1", text[pos:])
+        if m is None:
+            out.append(text[pos:])
+            break
+        start = pos + m.start()
+        out.append(text[pos:start])
+        arr_open = text.find("})([[", start)
+        if arr_open < 0:
+            raise TimetableError("Unrecognized ajax obfuscation wrapper")
+        arr_start = arr_open + len("})([[")
+        end = re.search(r"\]\],(\d+)\);", text[arr_start:])
+        if end is None:
+            raise TimetableError("Unrecognized ajax obfuscation wrapper")
+        arr = json.loads("[[" + text[arr_start:arr_start + end.start()] + "]]")
+        k = int(end.group(1))
+        src: list[str] = []
+        for flag, payload in arr:
+            if flag:
+                src.append(payload)
+                continue
+            chars = []
+            for j in range(0, len(payload), 4):
+                chars.append(chr(int(payload[j:j + 4], 16)
+                                 ^ ((k + (j // 4) * 13) & 255)))
+            src.append("".join(chars))
+        out.append("".join(src))
+        pos = arr_start + end.end()
+    return "".join(out)
+
+
 def _decode_st_page(html: str) -> str:
-    """Replace hour-obfuscated-v2 script blocks with their decoded source."""
+    """Replace hour-obfuscated-v2 script blocks with their decoded source.
+
+    The decoded source may itself contain hour-ajax-obfuscated-v1 blocks
+    (request code and response-key function since enc5); those are decoded
+    in a second pass.
+    """
     def repl(m: re.Match) -> str:
         body = m.group(2)
         if "hour-obfuscated" not in body:
             return m.group(0)
         return m.group(1) + _decode_obfuscated_block(body) + m.group(3)
-    return re.sub(r"(<script\b[^>]*>)(.*?)(</script\s*>)", repl, html,
-                  flags=re.I | re.S)
+    decoded = re.sub(r"(<script\b[^>]*>)(.*?)(</script\s*>)", repl, html,
+                     flags=re.I | re.S)
+    if "hour-ajax-obfuscated-v1" in decoded:
+        decoded = _decode_ajax_obfuscated_block(decoded)
+    return decoded
+
+
+# --- Pure-Python AES decryption (FIPS 197) ---
+# AES is not in the standard library and this watcher stays stdlib-only, so
+# Comci's encrypted (enc5/enc1) responses are decrypted here. Only
+# decryption is needed: the server encrypts, we verify the HMAC-SHA256 tag
+# and decrypt AES-CBC with PKCS#7 unpadding.
+_AES_SBOX: list[int] | None = None
+_AES_INV_SBOX: list[int] | None = None
+_AES_MUL: dict[int, list[int]] = {}
+
+
+def _aes_build_tables() -> None:
+    global _AES_SBOX, _AES_INV_SBOX
+    if _AES_SBOX is not None:
+        return
+
+    def gf_mul(a: int, b: int) -> int:
+        p = 0
+        for _ in range(8):
+            if b & 1:
+                p ^= a
+            hi = a & 0x80
+            a = (a << 1) & 0xFF
+            if hi:
+                a ^= 0x1B
+            b >>= 1
+        return p
+
+    def gf_inv(a: int) -> int:
+        result, base, exp = 1, a, 254
+        while exp:
+            if exp & 1:
+                result = gf_mul(result, base)
+            base = gf_mul(base, base)
+            exp >>= 1
+        return result
+
+    def rotl8(x: int, n: int) -> int:
+        return ((x << n) | (x >> (8 - n))) & 0xFF
+
+    sbox = []
+    for i in range(256):
+        inv = 0 if i == 0 else gf_inv(i)
+        sbox.append(inv ^ rotl8(inv, 1) ^ rotl8(inv, 2)
+                    ^ rotl8(inv, 3) ^ rotl8(inv, 4) ^ 0x63)
+    inv_sbox = [0] * 256
+    for i, s in enumerate(sbox):
+        inv_sbox[s] = i
+    for factor in (9, 11, 13, 14):
+        _AES_MUL[factor] = [gf_mul(factor, x) for x in range(256)]
+    _AES_SBOX = sbox
+    _AES_INV_SBOX = inv_sbox
+
+
+_AES_RCON = (0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80, 0x1B, 0x36)
+
+
+def _aes_expand_key(key: bytes) -> tuple[list[bytes], int]:
+    _aes_build_tables()
+    assert _AES_SBOX is not None
+    nk = len(key) // 4
+    nr = nk + 6
+    w = [list(key[4 * i:4 * i + 4]) for i in range(nk)]
+    for i in range(nk, 4 * (nr + 1)):
+        temp = list(w[i - 1])
+        if i % nk == 0:
+            temp = temp[1:] + temp[:1]
+            temp = [_AES_SBOX[b] for b in temp]
+            temp[0] ^= _AES_RCON[i // nk - 1]
+        elif nk > 6 and i % nk == 4:
+            temp = [_AES_SBOX[b] for b in temp]
+        w.append([w[i - nk][j] ^ temp[j] for j in range(4)])
+    round_keys = [bytes(w[4 * r] + w[4 * r + 1] + w[4 * r + 2] + w[4 * r + 3])
+                  for r in range(nr + 1)]
+    return round_keys, nr
+
+
+def _aes_decrypt_block(block: bytes, round_keys: list[bytes], nr: int) -> bytes:
+    assert _AES_INV_SBOX is not None
+    s = [b ^ round_keys[nr][i] for i, b in enumerate(block)]
+    mul9, mul11, mul13, mul14 = (_AES_MUL[9], _AES_MUL[11],
+                                 _AES_MUL[13], _AES_MUL[14])
+    for rnd in range(nr - 1, 0, -1):
+        # InvShiftRows: row r shifts right by r (state is column-major).
+        s = [s[4 * ((c - r) % 4) + r] for c in range(4) for r in range(4)]
+        s = [_AES_INV_SBOX[b] for b in s]  # InvSubBytes
+        rk = round_keys[rnd]
+        s = [b ^ rk[i] for i, b in enumerate(s)]  # AddRoundKey
+        t = [0] * 16  # InvMixColumns
+        for c in range(4):
+            a0, a1, a2, a3 = s[4 * c], s[4 * c + 1], s[4 * c + 2], s[4 * c + 3]
+            t[4 * c] = mul14[a0] ^ mul11[a1] ^ mul13[a2] ^ mul9[a3]
+            t[4 * c + 1] = mul9[a0] ^ mul14[a1] ^ mul11[a2] ^ mul13[a3]
+            t[4 * c + 2] = mul13[a0] ^ mul9[a1] ^ mul14[a2] ^ mul11[a3]
+            t[4 * c + 3] = mul11[a0] ^ mul13[a1] ^ mul9[a2] ^ mul14[a3]
+        s = t
+    s = [s[4 * ((c - r) % 4) + r] for c in range(4) for r in range(4)]
+    s = [_AES_INV_SBOX[b] for b in s]
+    rk = round_keys[0]
+    return bytes(b ^ rk[i] for i, b in enumerate(s))
+
+
+def _aes_cbc_decrypt(ciphertext: bytes, key: bytes, iv: bytes) -> bytes:
+    if len(key) not in (16, 24, 32):
+        raise TimetableError("Invalid encryption key length")
+    if len(iv) != 16 or not ciphertext or len(ciphertext) % 16:
+        raise TimetableError("Invalid encrypted response length")
+    round_keys, nr = _aes_expand_key(key)
+    out = bytearray()
+    prev = iv
+    for off in range(0, len(ciphertext), 16):
+        block = ciphertext[off:off + 16]
+        plain = _aes_decrypt_block(block, round_keys, nr)
+        out.extend(a ^ b for a, b in zip(plain, prev))
+        prev = block
+    if not out:
+        raise TimetableError("Invalid encrypted response padding")
+    pad = out[-1]
+    if not 1 <= pad <= 16 or out[-pad:] != bytes([pad]) * pad:
+        raise TimetableError("Invalid encrypted response padding")
+    return bytes(out[:-pad])
+
+
+def _decode_encrypted_response(text: str, key: bytes, version: str) -> dict:
+    """Verify and decrypt an enc5/enc1 timetable envelope; return the JSON dict.
+
+    Envelope: version:iv:ciphertext:hmac — base64 fields for enc5+,
+    hex fields for enc1. The HMAC key is SHA-256(key) over the first three
+    fields joined by ':'.
+    """
+    if not isinstance(version, str) or not re.fullmatch(r"enc[0-9]+", version):
+        raise TimetableError("Unsupported encryption version")
+    fields = text.rstrip("\x00").split(":")
+    if len(fields) != 4 or fields[0] not in (version, "enc1"):
+        raise TimetableError("Encrypted response protocol mismatch")
+    try:
+        if fields[0] != "enc1":
+            parts = [base64.b64decode(field, validate=True) for field in fields[1:]]
+            if any(base64.b64encode(part).decode("ascii") != field
+                   for part, field in zip(parts, fields[1:])):
+                raise ValueError
+        else:
+            if any(not re.fullmatch(r"(?:[0-9a-f]{2})*", field)
+                   for field in fields[1:]):
+                raise ValueError
+            parts = [bytes.fromhex(field) for field in fields[1:]]
+    except (ValueError, binascii.Error):
+        raise TimetableError("Invalid encrypted response encoding") from None
+    iv, ciphertext, tag = parts
+    if len(iv) != 16 or len(tag) != 32 or not ciphertext or len(ciphertext) % 16:
+        raise TimetableError("Invalid encrypted response length")
+    expected = hmac.new(hashlib.sha256(key).digest(),
+                        ":".join(fields[:3]).encode("utf-8"),
+                        hashlib.sha256).digest()
+    if not hmac.compare_digest(expected, tag):
+        raise TimetableError("Encrypted response authentication failed")
+    try:
+        plain = _aes_cbc_decrypt(ciphertext, key, iv).decode("utf-8").rstrip("\x00")
+        value = json.loads(plain)
+    except (UnicodeDecodeError, ValueError):
+        raise TimetableError("Invalid encrypted response content") from None
+    if not isinstance(value, dict):
+        raise TimetableError("Encrypted response JSON root must be an object")
+    return value
+
+
+def _parse_enc_service_protocol(content: str) -> dict | None:
+    """Extract the encrypted timetable protocol from the decoded /st page.
+
+    Returns None when the page has no QAjaxTimetable (legacy protocol).
+    Otherwise returns route, version (e.g. 'enc5'), request token (or None
+    when the page does not advertise the X-Hour-Token header) and the
+    response key bytes. Only literal page fragments are interpreted; the
+    key expression may be a plain hex literal or a reordering of literal
+    hex fragments, as in the page's HChange function.
+    """
+    school = re.search(
+        r"function\s+QAjaxSchool\s*\([^)]*\)\s*\{(?:(?!\bfunction\b).)*?"
+        r"url\s*:\s*'\.(/\d+)\?'\s*\+\s*encodeURIComponent\(btoa\("
+        r"'(\d+l)'\s*\+\s*encodeURIComponent\(sc\)\s*\+\s*'_(enc\d+)'\)\)",
+        content, re.S)
+    timetable = re.search(
+        r"function\s+QAjaxTimetable\s*\([^)]*\)\s*\{(?:(?!\bfunction\b).)*?"
+        r"url\s*:\s*'\.(/\d+)\?'\s*\+\s*btoa\([^;{}]*?'_(enc[0-9]+)'\s*\)",
+        content, re.S)
+    if timetable is None:
+        return None
+    endpoint, version = timetable.groups()
+    if school is not None and (school.group(1), school.group(3)) != (endpoint, version):
+        raise TimetableError(
+            "Comcigan service page structure changed: school and timetable "
+            "request protocols do not match")
+    section_end = re.search(r"\bfunction\s+\w+\s*\(", content[timetable.end():])
+    section = content[timetable.start():
+                      timetable.end() + (section_end.start() if section_end else 0)]
+    token = None
+    if re.search(r"['\"]X-Hour-Token['\"]\s*:\s*window\.__HourRequestToken",
+                 section) is not None:
+        token_match = re.search(
+            r"\bwindow\.__HourRequestToken\s*=\s*(['\"])([0-9a-fA-F]+)\1\s*;",
+            content)
+        if token_match is None:
+            raise TimetableError("Unable to parse Comcigan request token literal")
+        token = token_match.group(2)
+    key_match = re.search(
+        r"var\s+key\s*=\s*CryptoJS\.enc\.Hex\.parse\((.*?)\);", content, re.S)
+    if key_match is None:
+        raise TimetableError("Unable to parse Comcigan response key")
+    expression = key_match.group(1).strip()
+    literal = re.fullmatch(r"'([0-9a-fA-F]+)'", expression)
+    if literal:
+        key_hex = literal.group(1)
+    else:
+        pieces = re.fullmatch(
+            r"\(function\(a\)\{return\s+(a\[\d+\](?:\+a\[\d+\])*)\s*;\}\)\((\[.*\])\)",
+            expression, re.S)
+        if pieces is None:
+            raise TimetableError("Unable to parse Comcigan response key expression")
+        if re.fullmatch(r"\[\s*'[0-9a-fA-F]+'(?:\s*,\s*'[0-9a-fA-F]+')*\s*\]",
+                        pieces.group(2)) is None:
+            raise TimetableError("Invalid Comcigan response key fragments")
+        fragments = ast.literal_eval(pieces.group(2))
+        indexes = [int(i) for i in re.findall(r"a\[(\d+)\]", pieces.group(1))]
+        if any(i >= len(fragments) for i in indexes):
+            raise TimetableError("Invalid Comcigan response key indexes")
+        key_hex = "".join(fragments[i] for i in indexes)
+    if len(key_hex) not in (32, 48, 64):
+        raise TimetableError("Invalid Comcigan response key size")
+    return {"route": endpoint.lstrip("/"), "version": version,
+            "token": token, "key": bytes.fromhex(key_hex)}
 
 
 # Extraction patterns over the decoded /st source (same approach as
@@ -377,13 +663,55 @@ _COMCI_REQUIRED = ("route", "tt_prefix", "teacher", "subject", "daily", "origina
 
 _comci_codes_cache: dict | None = None
 
+RPI_SSH = os.getenv("TIMETABLE_RPI_SSH",
+                    "/home/hatch/workspace/.ssh-tunnel/rpi_ssh.sh")
+
+
+def _comci_http_get(url: str, headers: dict, limit: int,
+                    description: str) -> bytes:
+    """GET a Comci URL and return the body, bounded by limit.
+
+    With TIMETABLE_FETCH_VIA_RPI=1 (VM-side health checks only) the
+    request is piped through the Raspberry Pi over SSH, because the
+    VM's egress proxy truncates large Comci responses. Main (running
+    on the Pi) never sets the variable and fetches directly.
+    """
+    if os.getenv("TIMETABLE_FETCH_VIA_RPI") == "1":
+        import shlex
+        import subprocess
+
+        parts = ["curl -sf --max-time 25"]
+        for k, v in headers.items():
+            parts.append(f"-H {shlex.quote(f'{k}: {v}')}")
+        parts.append(shlex.quote(url))
+        p = subprocess.run([RPI_SSH, " ".join(parts)],
+                           capture_output=True, timeout=70)
+        if p.returncode != 0 or not p.stdout:
+            raise TimetableError(
+                f"Comci via-RPi fetch failed (rc={p.returncode}): "
+                f"{description}")
+        if len(p.stdout) > limit:
+            raise TimetableError(f"{description} response too large")
+        return p.stdout
+    req = urllib.request.Request(url, headers=headers)
+    with urllib.request.urlopen(req, timeout=25) as response:
+        if response.getcode() != 200:
+            raise TimetableError(
+                f"Comci returned HTTP {response.getcode()}")
+        return read_bounded(response, limit, description)
+
 
 def comci_codes() -> dict:
     """Route/prefix/자료 key numbers for the Comci API, extracted live.
 
     Comci rotates these numbers within a day, so they are re-read from the
-    /st page on first use in each process. On any failure the 2026-11-04
-    fallback constants are returned, which is no worse than hardcoding.
+    /st page on first use in each process. On the legacy (pre-enc5) page a
+    failure falls back to the 2026-11-04 constants, which is no worse than
+    hardcoding. On an encrypted (enc5) page there is no usable fallback —
+    the route, request token and response key all rotate with the page — so
+    an extraction failure raises instead of returning stale constants.
+    The returned dict also carries "version" (e.g. "enc5", absent for the
+    legacy protocol), "token" and "key" when the page uses encryption.
     """
     global _comci_codes_cache
     if _comci_codes_cache is not None:
@@ -391,20 +719,41 @@ def comci_codes() -> dict:
     fallback = {"route": COMCI_ROUTE, "tt_prefix": COMCI_TT_PREFIX,
                 **COMCI_FALLBACK_KEYS}
     last_err: Exception | None = None
+    enc_detected = False
     for _ in range(3):
         try:
-            req = urllib.request.Request(f"{COMCI_BASE}/st",
-                                         headers={"User-Agent": USER_AGENT})
-            with urllib.request.urlopen(req, timeout=25) as response:
-                body = read_bounded(response, MAX_BOOTSTRAP_BYTES, "Comci /st")
+            body = _comci_http_get(f"{COMCI_BASE}/st",
+                                   {"User-Agent": USER_AGENT},
+                                   MAX_BOOTSTRAP_BYTES, "Comci /st")
             content = _decode_st_page(body.decode("cp949", "replace"))
+            if "QAjaxTimetable" in content or "HChange" in content:
+                enc_detected = True
+            protocol = _parse_enc_service_protocol(content)
             codes = dict(fallback)
             for name, pat in _COMCI_PATTERNS.items():
+                if protocol is not None and name == "route":
+                    continue
                 m = re.search(pat, content)
                 if m is not None:
                     codes[name] = m.group(1)
-            missing = [n for n in _COMCI_REQUIRED if codes[n] == fallback[n]
-                       and re.search(_COMCI_PATTERNS[n], content) is None]
+            if protocol is not None:
+                codes.update(protocol)
+                required = ("route", "tt_prefix", "teacher", "subject",
+                            "daily", "original", "version", "key")
+            else:
+                required = _COMCI_REQUIRED
+            missing = []
+            for n in required:
+                if protocol is not None and n in protocol:
+                    # Route/version/key/token come from the protocol parser,
+                    # not from the legacy patterns.
+                    if codes.get(n) in (None, ""):
+                        missing.append(n)
+                elif n in _COMCI_PATTERNS:
+                    if re.search(_COMCI_PATTERNS[n], content) is None:
+                        missing.append(n)
+                elif codes.get(n) in (None, ""):
+                    missing.append(n)
             if missing:
                 raise TimetableError(f"Comci code extraction failed: {missing}")
             codes["route"] = codes["route"].lstrip("/")
@@ -413,6 +762,8 @@ def comci_codes() -> dict:
         except Exception as exc:  # noqa: BLE001 - fall back on any failure
             last_err = exc
             time.sleep(2)
+    if enc_detected:
+        raise TimetableError(f"Comci code extraction failed ({last_err})")
     print(f"WARNING: Comci code extraction failed ({last_err}); "
           "using fallback constants", file=sys.stderr)
     _comci_codes_cache = fallback
@@ -468,19 +819,25 @@ def decode_comci(payload: dict, keys: dict | None = None) -> Decoded:
 
 
 def _comci_fetch_json(school_code: str, period: int, codes: dict) -> dict:
-    raw = f"{codes['tt_prefix']}_{school_code}_0_{period}"
+    version = codes.get("version")
+    if version:
+        if not codes.get("key"):
+            raise TimetableError("Comci code extraction failed: ['key']")
+        raw = f"{codes['tt_prefix']}_{school_code}_0_{period}_{version}"
+    else:
+        raw = f"{codes['tt_prefix']}_{school_code}_0_{period}"
     query = base64.b64encode(raw.encode()).decode()
     url = f"{COMCI_BASE}/{codes['route']}?{query}"
+    headers = {"User-Agent": USER_AGENT, "Referer": f"{COMCI_BASE}/st"}
+    if codes.get("token"):
+        headers["X-Hour-Token"] = codes["token"]
     last_err: Exception | None = None
     for _ in range(5):  # Comci sometimes truncates large responses mid-stream.
         try:
-            req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT,
-                                                        "Referer": f"{COMCI_BASE}/st"})
-            with urllib.request.urlopen(req, timeout=25) as response:
-                if response.getcode() != 200:
-                    raise TimetableError(f"Comci returned HTTP {response.getcode()}")
-                body = read_bounded(response, MAX_COMCI_BYTES, "Comci")
+            body = _comci_http_get(url, headers, MAX_COMCI_BYTES, "Comci")
             text = body.replace(b"\x00", b"").decode("utf-8", "replace")
+            if version:
+                return _decode_encrypted_response(text, codes["key"], version)
             return json.loads(text[: text.rindex("}") + 1])
         except (urllib.error.URLError, OSError, ValueError) as exc:
             last_err = exc

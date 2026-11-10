@@ -1,9 +1,10 @@
 import base64
+from dataclasses import dataclass
 from typing import List
 from urllib import parse
+
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
-from types import SimpleNamespace
 
 from .encrypted_response import decode_response
 from .service_protocol import ServiceProtocol
@@ -20,14 +21,30 @@ HEADERS = {
 KOR_ENC = 'cp949'
 
 
-def get_response_encoding(url: str, encoding: str, request_token: str = None) -> SimpleNamespace:
+@dataclass(frozen=True)
+class _Response:
+    """The response fields consumed by this library."""
+
+    text: str
+    status_code: int
+
+
+def get_response_encoding(url: str, encoding: str, request_token: str = None) -> _Response:
+    """Fetch a page with per-request headers and a 30-second timeout.
+
+    HTTP 403/429 retain the token/rate-limit errors; other HTTP and network
+    failures propagate as urllib/OSError exceptions. Response streams are closed
+    on success, HTTP errors, and read failures.
+    """
     headers = dict(HEADERS)
     if request_token is not None:
         headers['X-Hour-Token'] = request_token
     try:
         with urlopen(Request(url, headers=headers), timeout=30) as response:
-            return SimpleNamespace(text=response.read().decode(encoding, errors='replace'),
-                                   status_code=response.status)
+            return _Response(
+                text=response.read().decode(encoding, errors='replace'),
+                status_code=response.status,
+            )
     except HTTPError as error:
         error.close()
         if error.code == 403:
@@ -37,7 +54,7 @@ def get_response_encoding(url: str, encoding: str, request_token: str = None) ->
         raise
 
 
-def get_comcigan_response_for_codes() -> SimpleNamespace:
+def get_comcigan_response_for_codes() -> _Response:
     """Fetch the Comcigan service page used to extract response codes."""
     return get_response_encoding(f"{COMCIGAN_URL}/st", KOR_ENC)
 

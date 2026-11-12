@@ -24,7 +24,7 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-BASE = "https://timetable.s2h9.dev"  # Student-facing viewer link shown in messages.
+BASE = "http://comci.net:4082/st"  # Official Comci student page link shown in messages.
 # Live data comes from the original Comci server (comci.net) via pycomcigan,
 # not the viewer: the viewer's CDN challenges non-browser clients with a
 # bot check (HTTP 403).
@@ -639,7 +639,7 @@ def format_message(target: date, grade: int, classroom: int, lessons: list[dict[
         marker = " (변동됨)" if x.get("site_changed") or x["period"] in changed_periods else ""
         lines.append(f"{x['period']}교시 {_current_lesson(x)}{marker}")
     lines.extend(["", f"사이트 최종 업데이트: {_short_update(last_update)}", "",
-                  f"{BASE}/?sc={school_code}"])
+                  BASE])
     return "\n".join(lines)
 
 

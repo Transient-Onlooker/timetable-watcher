@@ -260,8 +260,9 @@ def _rpi_curl_bytes(url: str, headers: dict) -> bytes:
     import shlex
     import subprocess
 
-    # Pi loopback 18082 = VM 경유 릴레이 (집 IP가 컴시간에 차단된 동안 사용).
-    parts = ["curl -sf --max-time 25 --proxy http://127.0.0.1:18082"]
+    # Pi loopback 18084 = Pi 로컬 WARP 브리지 (집 IP가 컴시간에 차단된 동안 사용).
+    # 18082는 VM 경유 릴레이로, 폴백으로 유지된다.
+    parts = ["curl -sf --max-time 25 --proxy http://127.0.0.1:18084"]
     for k, v in headers.items():
         parts.append(f"-H {shlex.quote(f'{k}: {v}')}")
     parts.append(shlex.quote(url))
